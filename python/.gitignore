@@ -1,4 +1,10 @@
-lib
+taichi/_lib/c_api
+taichi/_lib/runtime
+taichi/_lib/core/*.so
+taichi/_lib/core/*.pyd
 taichi.egg-info
 taichi/include
-setup.py
+taichi/assets
+taichi/tests
+taichi/tests38
+release

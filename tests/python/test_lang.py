@@ -1,101 +1,162 @@
+import numpy as np
+import pytest
+from taichi.lang.misc import get_host_arch_list
+
 import taichi as ti
-from pytest import approx
+from tests import test_utils
 
-def test_clear():
-  return
-  ti.reset()
-  x = ti.var(ti.i32)
 
-  @ti.layout
-  def place():
-    ti.root.dense(ti.i, 1).place(x)
-
-  x[0] = 1
-  assert x[0] == 1
-  x.clear()
-  assert x[0] == 0
-
+@test_utils.test()
 def test_nested_subscript():
-  ti.reset()
+    x = ti.field(ti.i32)
+    y = ti.field(ti.i32)
 
-  x = ti.var(ti.i32)
-  y = ti.var(ti.i32)
-
-  @ti.layout
-  def place():
     ti.root.dense(ti.i, 1).place(x)
     ti.root.dense(ti.i, 1).place(y)
 
-  x[0] = 0
+    x[0] = 0
 
-  @ti.kernel
-  def inc():
-    for i in range(1):
-      x[x[i]] += 1
+    @ti.kernel
+    def inc():
+        for i in range(1):
+            x[x[i]] += 1
 
-  inc()
+    inc()
 
-  assert x[0] == 1
+    assert x[0] == 1
 
 
-@ti.program_test
+@test_utils.test()
 def test_norm():
-  val = ti.var(ti.i32)
-  f = ti.var(ti.f32)
-  
-  n = 1024
-  
-  @ti.layout
-  def values():
+    val = ti.field(ti.i32)
+    f = ti.field(ti.f32)
+
+    n = 1024
+
     ti.root.dense(ti.i, n).dense(ti.i, 2).place(val, f)
-  
-  @ti.kernel
-  def test():
-    for i in range(n):
-      s = 0
-      for j in range(10):
-        s += j
-      a = ti.Vector([0.4, 0.3])
-      val[i] = s + ti.cast(a.norm() * 100, ti.i32) + i
-  
-  test()
-  
-  @ti.kernel
-  def test2():
-    for i in range(n):
-      val[i] += 1
-  
-  test2()
-  
-  for i in range(n):
-    assert val[i] == 96 + i
-    
 
-@ti.program_test
+    @ti.kernel
+    def test():
+        for i in range(n):
+            s = 0
+            for j in range(10):
+                s += j
+            a = ti.Vector([0.4, 0.3])
+            val[i] = s + ti.cast(a.norm() * 100, ti.i32) + i
+
+    test()
+
+    @ti.kernel
+    def test2():
+        for i in range(n):
+            val[i] += 1
+
+    test2()
+
+    for i in range(n):
+        assert val[i] == 96 + i
+
+
+@test_utils.test()
 def test_simple2():
-  val = ti.var(ti.i32)
-  f = ti.var(ti.f32)
-  
-  n = 16
-  
-  @ti.layout
-  def values():
-    ti.root.dense(ti.i, n).place(val, f)
-  
-  @ti.kernel
-  def test():
-    for i in range(n):
-      val[i] = i * 2
-  
-  test()
-  
-  @ti.kernel
-  def test2():
-    for i in range(n):
-      val[i] += 1
-  
-  test2()
-  
-  for i in range(n):
-    assert val[i] == 1 + i * 2
+    val = ti.field(ti.i32)
+    f = ti.field(ti.f32)
 
+    n = 16
+
+    ti.root.dense(ti.i, n).place(val, f)
+
+    @ti.kernel
+    def test():
+        for i in range(n):
+            val[i] = i * 2
+
+    test()
+
+    @ti.kernel
+    def test2():
+        for i in range(n):
+            val[i] += 1
+
+    test2()
+
+    for i in range(n):
+        assert val[i] == 1 + i * 2
+
+
+@test_utils.test()
+def test_recreate():
+    @ti.kernel
+    def test():
+        a = 0
+        a, b = 1, 2
+
+    test()
+
+
+@test_utils.test(exclude=[ti.amdgpu])
+def test_local_atomics():
+    n = 32
+    val = ti.field(ti.i32, shape=n)
+
+    @ti.kernel
+    def test():
+        for i in range(n):
+            s = 0
+            s += 45
+            print(s)
+            val[i] = s + i
+            print(val[i])
+
+    test()
+
+    for i in range(n):
+        assert val[i] == i + 45
+
+
+@test_utils.test(arch=get_host_arch_list())
+def test_loop_var_life():
+    @ti.kernel
+    def test():
+        for i in ti.static(range(8)):
+            pass
+        print(i)
+
+    with pytest.raises(Exception):
+        test()
+
+
+@test_utils.test(arch=get_host_arch_list())
+def test_loop_var_life_double_iters():
+    @ti.kernel
+    def test():
+        for i, v in ti.static(enumerate(range(8))):
+            pass
+        print(i)
+
+    with pytest.raises(Exception):
+        test()
+
+
+@pytest.mark.parametrize("dtype", [ti.i32, ti.f32, ti.i64, ti.f64])
+@pytest.mark.parametrize("ti_zero,zero", [(ti.zero, 0), (ti.one, 1)])
+@pytest.mark.parametrize("is_mat", [False, True])
+@test_utils.test(arch=ti.cpu)
+def test_meta_zero_one(dtype, ti_zero, zero, is_mat):
+    if is_mat:
+        x = ti.Matrix.field(2, 3, dtype, ())
+        y = ti.Matrix.field(2, 3, dtype, ())
+    else:
+        x = ti.field(dtype, ())
+        y = ti.field(dtype, ())
+
+    @ti.kernel
+    def func():
+        y[None] = ti_zero(x[None])
+
+    for a in [-1, -2.3, -1, -0.3, 0, 1, 1.9, 2, 3]:
+        if ti.types.is_integral(dtype):
+            a = int(a)
+        x.fill(a)
+        func()
+        assert np.all(y.to_numpy() == zero)

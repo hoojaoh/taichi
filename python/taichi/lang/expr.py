@@ -1,265 +1,170 @@
-from .core import taichi_lang_core
-from .util import *
-import traceback
+import numpy as np
+from taichi._lib import core as _ti_core
+from taichi.lang import impl
+from taichi.lang.common_ops import TaichiOperations
+from taichi.lang.exception import TaichiCompilationError, TaichiTypeError
+from taichi.lang.matrix import make_matrix
+from taichi.lang.util import is_matrix_class, is_taichi_class, to_numpy_type
+from taichi.types import primitive_types
+from taichi.types.primitive_types import integer_types, real_types
 
 
 # Scalar, basic data type
-class Expr:
-  materialize_layout_callback = None
-  layout_materialized = False
+class Expr(TaichiOperations):
+    """A Python-side Expr wrapper, whose member variable `ptr` is an instance of C++ Expr class. A C++ Expr object contains member variable `expr` which holds an instance of C++ Expression class."""
 
-  def __init__(self, *args, tb=None):
-    self.getter = None
-    self.setter = None
-    self.tb = tb
-    self.from_torch_ = None
-    self.to_torch_ = None
-    if len(args) == 1:
-      if isinstance(args[0], taichi_lang_core.Expr):
-        self.ptr = args[0]
-      elif isinstance(args[0], Expr):
-        self.ptr = args[0].ptr
-        self.tb = args[0].tb
-      else:
-        arg = args[0]
-        try:
-          import numpy as np
-          if isinstance(arg, np.ndarray):
-            arg = arg.dtype(arg)
-        except:
-          pass
-        from .impl import make_constant_expr
-        self.ptr = make_constant_expr(arg).ptr
-    else:
-      assert False
-    if self.tb:
-      self.ptr.set_tb(self.tb)
-    self.grad = None
-    self.val = self
+    def __init__(self, *args, dbg_info=None, dtype=None):
+        self.dbg_info = dbg_info
+        self.ptr_type_checked = False
+        if len(args) == 1:
+            if isinstance(args[0], _ti_core.Expr):
+                self.ptr = args[0]
+            elif isinstance(args[0], Expr):
+                self.ptr = args[0].ptr
+                self.ptr_type_checked = args[0].ptr_type_checked
+                self.dbg_info = args[0].dbg_info
+            elif is_matrix_class(args[0]):
+                self.ptr = make_matrix(args[0].to_list()).ptr
+            elif isinstance(args[0], (list, tuple)):
+                self.ptr = make_matrix(args[0]).ptr
+            else:
+                # assume to be constant
+                arg = args[0]
+                if isinstance(arg, np.ndarray):
+                    if arg.shape:
+                        raise TaichiTypeError(
+                            "Only 0-dimensional numpy array can be used to initialize a scalar expression"
+                        )
+                    arg = arg.dtype.type(arg)
+                self.ptr = make_constant_expr(arg, dtype).ptr
+        else:
+            assert False
+        if self.dbg_info:
+            self.ptr.set_dbg_info(self.dbg_info)
+        if not self.ptr_type_checked:
+            self.ptr.type_check(impl.get_runtime().prog.config())
+            self.ptr_type_checked = True
 
-  @staticmethod
-  def stack_info():
-    s = traceback.extract_stack()[3:-1]
-    raw = ''.join(traceback.format_list(s))
-    # remove the confusing last line
-    return '\n'.join(raw.split('\n')[:-2]) + '\n'
+    def is_tensor(self):
+        return self.ptr.is_tensor()
 
-  def __add__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_add(self.ptr, other.ptr), tb=self.stack_info())
-  __radd__ = __add__
+    def is_struct(self):
+        return self.ptr.is_struct()
 
-  def __iadd__(self, other):
-    self.assign(Expr(taichi_lang_core.expr_add(self.ptr, other.ptr)))
+    def element_type(self):
+        return self.ptr.get_rvalue_type().element_type()
 
+    def get_shape(self):
+        if not self.is_tensor():
+            raise TaichiCompilationError(f"Getting shape of non-tensor type: {self.ptr.get_rvalue_type()}")
+        return tuple(self.ptr.get_shape())
 
-  def __neg__(self):
-    return Expr(taichi_lang_core.expr_neg(self.ptr), tb=self.stack_info())
+    @property
+    def n(self):
+        shape = self.get_shape()
+        if len(shape) < 1:
+            raise TaichiCompilationError(f"Getting n of tensor type < 1D: {self.ptr.get_rvalue_type()}")
+        return shape[0]
 
-  def __sub__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_sub(self.ptr, other.ptr), tb=self.stack_info())
+    @property
+    def m(self):
+        shape = self.get_shape()
+        if len(shape) < 2:
+            raise TaichiCompilationError(f"Getting m of tensor type < 2D: {self.ptr.get_rvalue_type()}")
+        return shape[1]
 
-  def __isub__(self, other):
-    self.assign(Expr(taichi_lang_core.expr_sub(self.ptr, other.ptr)))
+    def __hash__(self):
+        return self.ptr.get_raw_address()
 
-  def __imul__(self, other):
-    self.assign(Expr(taichi_lang_core.expr_mul(self.ptr, other.ptr)))
+    def __str__(self):
+        return "<ti.Expr>"
 
-  def __idiv__(self, other):
-    self.assign(Expr(taichi_lang_core.expr_div(self.ptr, other.ptr)))
-
-  __itruediv__ = __idiv__
-
-  def __ifloordiv__(self, other):
-    self.assign(Expr(taichi_lang_core.expr_div(self.ptr, other.ptr)))
-
-  def __rsub__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_sub(other.ptr, self.ptr))
-
-  def __isub__(self, other):
-    self.assign(Expr(taichi_lang_core.expr_sub(self.ptr, other.ptr)))
-
-  def __mul__(self, other):
-    if is_taichi_class(other) and hasattr(other, '__rmul__'):
-      return other.__rmul__(self)
-    else:
-      other = Expr(other)
-      return Expr(taichi_lang_core.expr_mul(self.ptr, other.ptr))
-
-  __rmul__ = __mul__
-
-  def __mod__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_mod(self.ptr, other.ptr))
-
-  def __truediv__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_div(self.ptr, other.ptr))
-
-  def __rtruediv__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_div(other.ptr, self.ptr))
-
-  __floordiv__ = __truediv__
-  __rfloordiv__ = __rtruediv__
-
-  def __le__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_cmp_le(self.ptr, other.ptr))
-
-  def __lt__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_cmp_lt(self.ptr, other.ptr))
-
-  def __ge__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_cmp_ge(self.ptr, other.ptr))
-
-  def __gt__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_cmp_gt(self.ptr, other.ptr))
-
-  def __eq__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_cmp_eq(self.ptr, other.ptr))
-
-  def __ne__(self, other):
-    other = Expr(other)
-    return Expr(taichi_lang_core.expr_cmp_ne(self.ptr, other.ptr))
-
-  def __getitem__(self, item):
-    item = Expr(item)
-    return Expr(expr_index(self, item.ptr))
-
-  def __and__(self, item):
-    item = Expr(item)
-    return Expr(taichi_lang_core.expr_bit_and(self.ptr, item.ptr))
-
-  def __or__(self, item):
-    item = Expr(item)
-    return Expr(taichi_lang_core.expr_bit_or(self.ptr, item.ptr))
+    def __repr__(self):
+        return "<ti.Expr>"
 
 
-  def logical_and(self, item):
-    return self & item
+def _check_in_range(npty, val):
+    iif = np.iinfo(npty)
+    return iif.min <= val <= iif.max
 
-  def logical_or(self, item):
-    return self | item
 
-  def logical_not(self):
-    return Expr(taichi_lang_core.expr_bit_not(self.ptr), tb=self.stack_info())
+def _clamp_unsigned_to_range(npty, val):
+    # npty: np.int32 or np.int64
+    iif = np.iinfo(npty)
+    if iif.min <= val <= iif.max:
+        return val
+    cap = 1 << iif.bits
+    assert 0 <= val < cap
+    new_val = val - cap
+    return new_val
 
-  def assign(self, other):
-    taichi_lang_core.expr_assign(self.ptr, Expr(other).ptr, self.stack_info())
 
-  def serialize(self):
-    return self.ptr.serialize()
+def make_constant_expr(val, dtype):
+    if isinstance(val, (bool, np.bool_)):
+        constant_dtype = primitive_types.u1
+        return Expr(_ti_core.make_const_expr_bool(constant_dtype, val))
 
-  def initialize_accessor(self):
-    if self.getter:
-      return
-    snode = self.ptr.snode()
-    
-    if self.snode().data_type() == f32 or self.snode().data_type() == f64:
-      def getter(*key):
-        return snode.read_float(key[0], key[1], key[2], key[3])
-      def setter(value, *key):
-        snode.write_float(key[0], key[1], key[2], key[3], value)
-    else:
-      def getter(*key):
-        return snode.read_int(key[0], key[1], key[2], key[3])
-      def setter(value, *key):
-        snode.write_int(key[0], key[1], key[2], key[3], value)
-        
-    self.getter = getter
-    self.setter = setter
+    if isinstance(val, (float, np.floating)):
+        constant_dtype = impl.get_runtime().default_fp if dtype is None else dtype
+        if constant_dtype not in real_types:
+            raise TaichiTypeError(
+                "Floating-point literals must be annotated with a floating-point type. For type casting, use `ti.cast`."
+            )
+        return Expr(_ti_core.make_const_expr_fp(constant_dtype, val))
 
-  def __setitem__(self, key, value):
-    if not Expr.layout_materialized:
-      self.materialize_layout_callback()
-    self.initialize_accessor()
-    if key is None:
-      key = ()
-    if not isinstance(key, tuple):
-      key = (key, )
-    key = key + ((0, ) * (4 - len(key)))
-    self.setter(value, *key)
+    if isinstance(val, (int, np.integer)):
+        constant_dtype = impl.get_runtime().default_ip if dtype is None else dtype
+        if constant_dtype not in integer_types:
+            raise TaichiTypeError(
+                "Integer literals must be annotated with a integer type. For type casting, use `ti.cast`."
+            )
+        if _check_in_range(to_numpy_type(constant_dtype), val):
+            return Expr(_ti_core.make_const_expr_int(constant_dtype, _clamp_unsigned_to_range(np.int64, val)))
+        if dtype is None:
+            raise TaichiTypeError(
+                f"Integer literal {val} exceeded the range of default_ip: {impl.get_runtime().default_ip}, please specify the dtype via e.g. `ti.u64({val})` or set a different `default_ip` in `ti.init()`"
+            )
+        else:
+            raise TaichiTypeError(f"Integer literal {val} exceeded the range of specified dtype: {dtype}")
 
-  def __getitem__(self, key):
-    if not Expr.layout_materialized:
-      self.materialize_layout_callback()
-    self.initialize_accessor()
-    if key is None:
-      key = ()
-    if not isinstance(key, tuple):
-      key = (key, )
-    key = key + ((0, ) * (4 - len(key)))
-    return self.getter(*key)
+    raise TaichiTypeError(f"Invalid constant scalar data type: {type(val)}")
 
-  def loop_range(self):
-    return self
 
-  def augassign(self, x, op):
-    x = Expr(x)
-    if op == 'Add':
-      self += x
-    elif op == 'Sub':
-      self -= x
-    elif op == 'Mult':
-      self *= x
-    elif op == 'Div':
-      self /= x
-    elif op == 'FloorDiv':
-      self //= x
-    else:
-      assert False, op
+def make_var_list(size, ast_builder=None):
+    exprs = []
+    for _ in range(size):
+        if ast_builder is None:
+            exprs.append(impl.get_runtime().prog.make_id_expr(""))
+        else:
+            exprs.append(ast_builder.make_id_expr(""))
+    return exprs
 
-  def set_grad(self, grad):
-    self.grad = grad
-    self.ptr.set_grad(grad.ptr)
-
-  def clear(self, deactivate=False):
-    assert not deactivate
-    node = self.ptr.snode().parent
-    assert node
-    node.clear_data()
-
-  def atomic_add(self, other):
-    taichi_lang_core.expr_atomic_add(self.ptr, other.ptr)
-
-  def __pow__(self, power, modulo=None):
-    assert isinstance(power, int) and power >= 0
-    if power == 0:
-      return Expr(1)
-    ret = self
-    for i in range(power - 1):
-      ret = ret * self
-    return ret
-
-  def parent(self):
-    from .snode import SNode
-    return SNode(self.ptr.snode().parent)
-  
-  def snode(self):
-    from .snode import SNode
-    return SNode(self.ptr.snode())
-  
-  def __hash__(self):
-    return self.ptr.get_raw_address()
 
 def make_expr_group(*exprs):
-  if len(exprs) == 1:
-    from .matrix import Matrix
-    if (isinstance(exprs[0], list) or isinstance(exprs[0], tuple)):
-      exprs = exprs[0]
-    elif isinstance(exprs[0], Matrix):
-      mat = exprs[0]
-      assert mat.m == 1
-      exprs = mat.entries
-  expr_group = taichi_lang_core.ExprGroup()
-  for i in exprs:
-    expr_group.push_back(Expr(i).ptr)
-  return expr_group
+    from taichi.lang.matrix import Matrix  # pylint: disable=C0415
 
+    if len(exprs) == 1:
+        if isinstance(exprs[0], (list, tuple)):
+            exprs = exprs[0]
+        elif isinstance(exprs[0], Matrix):
+            mat = exprs[0]
+            assert mat.m == 1
+            exprs = mat.entries
+    expr_group = _ti_core.ExprGroup()
+    for i in exprs:
+        flattened = _get_flattened_ptrs(i)
+        for item in flattened:
+            expr_group.push_back(item)
+    return expr_group
+
+
+def _get_flattened_ptrs(val):
+    if is_taichi_class(val):
+        ptrs = []
+        for item in val._members:
+            ptrs.extend(_get_flattened_ptrs(item))
+        return ptrs
+    return [Expr(val).ptr]
+
+
+__all__ = []
